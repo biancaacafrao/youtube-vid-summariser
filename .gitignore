@@ -94,3 +94,5 @@ coverage/
 
 # Optional REPL history
 .node_repl_history 
+# Generated study guides
+study_guide*.html

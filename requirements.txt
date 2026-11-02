@@ -1,4 +1,5 @@
 pocketflow>=0.0.1
 openai
 python-dotenv
+PyYAML
 youtube-transcript-api

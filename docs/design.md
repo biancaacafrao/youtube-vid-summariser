@@ -15,7 +15,7 @@ A learner pastes a YouTube link and wants a **simple study guide** they can actu
 2. **See the topics.** I get a short list of the **key topics** the video actually covers (not a dump of every tangent).
 3. **Understand each topic simply.** For each topic I get a **plain-language explanation** — as if teaching a smart beginner. No jargon unless the video depends on it, and then it is explained.
 4. **Study with Q&A.** For each topic I get a few **questions and answers** grounded in the video, so I can check that I understood it.
-5. **Test myself.** I can switch to a **test mode**: one question at a time on a card. I see the question first, then flip to see the answer on the back.
+5. **Test myself.** I can switch to a **test mode**: one question at a time on a card. I see the question first, then flip to see the answer on the back. I mark each card **Got it** or **Missed it**, see my score at the end, and can retry just the ones I missed.
 
 ### Success looks like
 
@@ -27,15 +27,18 @@ A learner pastes a YouTube link and wants a **simple study guide** they can actu
 
 - No downloading or transcribing audio. **Captions/transcript only.**
 - No accounts, history, or saving study guides across sessions (unless we add that later).
-- No recommending other videos, quizzes with scoring, or spaced repetition.
+- No recommending other videos or spaced repetition. Scores are not saved between sessions.
 - No multi-language UI. Use the transcript language as-is; explanations in the same language as the video when possible.
 
-### Assumptions to confirm
+### Decisions (defaults, change if needed)
 
-- Input is a **single YouTube URL** per run (watch, `youtu.be`, shorts, or embed).
-- If there is **no caption track**, we stop with a clear failure — we do not fall back to Whisper/audio.
-- **LLM work** (topics, explanations, Q&A) is *not* a utility; it lives in nodes later.
-- Test-mode **cards** come after the study guide is generated. UI (CLI vs simple local page) is decided when we design the flow.
+- Input is a **single YouTube URL** per run (watch, `youtu.be`, shorts, embed, or live).
+- If there is **no caption track**, we stop with a clear failure. No fallback to Whisper/audio.
+- **LLM work** (topics, explanations, Q&A) is *not* a utility; it lives in nodes.
+- **Size of the guide:** 3–7 key topics, each with exactly 3 question/answer pairs (one *what*, one *why/how*, one *apply*).
+- **Long videos:** the whole transcript goes into one prompt. An hour of speech is roughly 10k words (~13k tokens), well inside `gpt-4o-mini`'s 128k-token window, so no chunking in v1. Map-reduce is the upgrade path if we hit the limit.
+- **Frontend, step 1:** the flow writes a single self-contained `study_guide.html` (study view + flip-card test mode). No server.
+- **Frontend, step 2 (later):** a small FastAPI server runs the same flow so people can paste a link in the browser. Needed because the API key must stay secret and the pipeline is Python.
 
 ## Flow Design
 
@@ -43,20 +46,38 @@ A learner pastes a YouTube link and wants a **simple study guide** they can actu
 > 1. Consider the design patterns of agent, map-reduce, rag, and workflow. Apply them if they fit.
 > 2. Present a concise, high-level description of the workflow.
 
-**Paused on purpose.** Next step together: pick a pattern (likely a simple **workflow**, maybe **map-reduce** if the transcript is long) and sketch nodes.
-
 ### Applicable Design Pattern:
 
-_(to design together)_
+1. **Workflow:** a fixed chain of steps (fetch → topics → explain → render). The task is well defined, so no agent decisions are needed.
+2. **Batch (per topic):** once topics are known, each topic is explained and quizzed independently. Each call sees the full transcript plus one topic, which keeps outputs focused and consistent.
+3. **Structured output:** LLM steps reply in YAML and are validated, so a malformed reply triggers the node's retry.
+
+Not used: **map-reduce** (transcripts fit in one prompt), **RAG** (one video, no search needed), **agent** (no open-ended decisions).
 
 ### Flow high-level Design:
 
-_(to design together)_
+1. **Fetch Transcript:** turns the YouTube link into transcript text.
+2. **Extract Topics:** reads the transcript and picks the 3–7 key topics, each with a title and a one-line summary.
+3. **Explain Topics (batch):** for each topic, writes a plain-language explanation and 3 Q&A pairs grounded in the transcript.
+4. **Render HTML:** writes one HTML page with the study guide and a flip-card test mode. No LLM.
 
 ```mermaid
-flowchart TD
-    todo[Flow to be designed together]
+flowchart LR
+    url([YouTube link]) --> fetch[Fetch Transcript]
+    fetch --> topics[Extract Topics]
+    topics --> explain
+
+    subgraph explain[Explain Topics: batch, one call per topic]
+        t1[Topic 1:<br/>explanation + Q&A]
+        t2[Topic 2:<br/>explanation + Q&A]
+        tn[Topic N ...]
+    end
+
+    explain --> render[Render HTML]
+    render --> page([study_guide.html<br/>study view + flip cards])
 ```
+
+**LLM calls per video:** 1 (topics) + N (one per topic) ≈ 4–8 calls. With `gpt-4o-mini` that is well under a cent per video.
 
 ## Utility Functions
 
@@ -161,10 +182,65 @@ sequenceDiagram
 
 > Notes for AI: Try to minimize data redundancy
 
-_(to design together after flow)_
+Each topic is one dict that later nodes fill in, so nothing is stored twice.
+
+```python
+shared = {
+    "url": "https://www.youtube.com/watch?v=...",  # input
+    "transcript": "full caption text ...",         # Fetch Transcript
+    "topics": [                                    # Extract Topics creates title + summary
+        {
+            "title": "What a neural network is",
+            "summary": "One-line description of the topic",
+            "explanation": "Plain-language explanation",   # Explain Topics adds
+            "questions": [                                 # Explain Topics adds
+                {"question": "...", "answer": "..."},
+            ],
+        },
+    ],
+    "output_path": "study_guide.html",             # Render HTML
+}
+```
 
 ### Node Steps
 
 > Notes for AI: Carefully decide whether to use Batch/Async Node/Flow.
 
-_(to design together after flow)_
+1. **Fetch Transcript**
+   - *Purpose*: get the text the whole guide is grounded in
+   - *Type*: Regular (retries for network blips)
+   - *Steps*:
+     - *prep*: read `url`
+     - *exec*: call `get_youtube_transcript`
+     - *post*: write `transcript`
+
+2. **Extract Topics**
+   - *Purpose*: pick the key topics the video actually covers, skipping tangents
+   - *Type*: Regular (retries on a malformed reply)
+   - *Steps*:
+     - *prep*: read `transcript`
+     - *exec*: call `call_llm` asking for 3–7 topics as YAML (title + summary), in the video's language; check it parses and the count is 3–7
+     - *post*: write `topics` (title + summary only)
+
+3. **Explain Topics**
+   - *Purpose*: make each topic easy to understand and testable
+   - *Type*: Batch (one item per topic)
+   - *Steps*:
+     - *prep*: return one item per topic: (transcript, topic title, topic summary, titles of the other topics so it does not repeat them)
+     - *exec*: call `call_llm` asking for a beginner-friendly explanation and 3 Q&A pairs as YAML, using only what the video says; check the fields exist
+     - *post*: add `explanation` and `questions` to each dict in `topics`
+
+4. **Render HTML**
+   - *Purpose*: turn the study guide into one page the learner can open
+   - *Type*: Regular (no LLM)
+   - *Steps*:
+     - *prep*: read `url` and `topics`
+     - *exec*: call `render_study_guide` to build the page
+     - *post*: save the file and write `output_path`
+
+### Render utility (step 1 frontend)
+
+3. **Render study guide** (`utils/render_study_guide.py`)
+   - *Input*: url (str), topics (list of dicts, as in the shared store)
+   - *Output*: HTML (str). One self-contained page: topic list with explanations and Q&A, plus a test mode with flip cards (question on the front, answer on the back), Got it / Missed it scoring, a score summary at the end, Retry missed and Shuffle
+   - Necessity: writing the output is an external-facing step, kept out of the nodes
