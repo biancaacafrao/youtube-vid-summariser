@@ -11,6 +11,10 @@ out/
 *.pyc
 __pycache__/
 
+# Virtual environment
+venv/
+.venv/
+
 # Environment files
 .env
 .env.local

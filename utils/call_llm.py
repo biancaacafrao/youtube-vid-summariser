@@ -1,15 +1,32 @@
-from openai import OpenAI
+import logging
 import os
 
-# Learn more about calling the LLM: https://the-pocket.github.io/PocketFlow/utility_function/llm.html
-def call_llm(prompt):    
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", "your-api-key"))
-    r = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}]
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+
+def call_llm(prompt: str) -> str:
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not set (add it to .env)")
+
+    client = OpenAI(api_key=api_key)
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    logger.info("Calling LLM model=%s (prompt length=%s)", model, len(prompt))
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
     )
-    return r.choices[0].message.content
-    
+    text = response.choices[0].message.content
+    logger.info("LLM response length=%s", len(text) if text else 0)
+    return text
+
+
 if __name__ == "__main__":
-    prompt = "What is the meaning of life?"
+    logging.basicConfig(level=logging.INFO)
+    prompt = "Are birds real?"
     print(call_llm(prompt))
