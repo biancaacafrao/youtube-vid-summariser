@@ -35,8 +35,8 @@ A learner pastes a YouTube link and wants a **simple study guide** they can actu
 - Input is a **single YouTube URL** per run (watch, `youtu.be`, shorts, embed, or live).
 - If there is **no caption track**, we stop with a clear failure. No fallback to Whisper/audio.
 - **LLM work** (topics, explanations, Q&A) is *not* a utility; it lives in nodes.
-- **Size of the guide:** 3–7 key topics, each with exactly 3 question/answer pairs (one *what*, one *why/how*, one *apply*).
-- **Long videos:** the whole transcript goes into one prompt. An hour of speech is roughly 10k words (~13k tokens), well inside `gpt-4o-mini`'s 128k-token window, so no chunking in v1. Map-reduce is the upgrade path if we hit the limit.
+- **Size of the guide:** 3–7 key topics, each with exactly 3 specific question/answer pairs (one clear answer each, no generic "why is X important" questions).
+- **Long videos:** the whole transcript goes into one prompt. An hour of speech is roughly 10k words (~13k tokens), well inside the model's context window, so no chunking in v1. Map-reduce is the upgrade path if we hit the limit.
 - **Frontend, step 1:** the flow writes a single self-contained `study_guide.html` (study view + flip-card test mode). No server.
 - **Frontend, step 2 (later):** a small FastAPI server runs the same flow so people can paste a link in the browser. Needed because the API key must stay secret and the pipeline is Python.
 
@@ -49,7 +49,7 @@ A learner pastes a YouTube link and wants a **simple study guide** they can actu
 ### Applicable Design Pattern:
 
 1. **Workflow:** a fixed chain of steps (fetch → topics → explain → render). The task is well defined, so no agent decisions are needed.
-2. **Batch (per topic):** once topics are known, each topic is explained and quizzed independently. Each call sees the full transcript plus one topic, which keeps outputs focused and consistent.
+2. **One call for all topics (not batch):** all explanations and Q&A are written in a single call that sees every topic at once. We first tried a batch (one call per topic), but each call picked the video's most memorable facts, so the same question appeared under several topics. One call can see every question and keep them all different.
 3. **Structured output:** LLM steps reply in YAML and are validated, so a malformed reply triggers the node's retry.
 
 Not used: **map-reduce** (transcripts fit in one prompt), **RAG** (one video, no search needed), **agent** (no open-ended decisions).
@@ -57,27 +57,20 @@ Not used: **map-reduce** (transcripts fit in one prompt), **RAG** (one video, no
 ### Flow high-level Design:
 
 1. **Fetch Transcript:** turns the YouTube link into transcript text.
-2. **Extract Topics:** reads the transcript and picks the 3–7 key topics, each with a title and a one-line summary.
-3. **Explain Topics (batch):** for each topic, writes a plain-language explanation and 3 Q&A pairs grounded in the transcript.
+2. **Extract Topics:** reads the transcript and picks the 3–7 key topics, each with a title, a one-line summary and 2–4 key points. Each key point belongs to exactly one topic, which sets clear boundaries between topics.
+3. **Explain Topics:** in one call, writes a plain-language explanation and 3 Q&A pairs for every topic, taken from that topic's key points, with no question repeated across the guide.
 4. **Render HTML:** writes one HTML page with the study guide and a flip-card test mode. No LLM.
 
 ```mermaid
 flowchart LR
     url([YouTube link]) --> fetch[Fetch Transcript]
     fetch --> topics[Extract Topics]
-    topics --> explain
-
-    subgraph explain[Explain Topics: batch, one call per topic]
-        t1[Topic 1:<br/>explanation + Q&A]
-        t2[Topic 2:<br/>explanation + Q&A]
-        tn[Topic N ...]
-    end
-
-    explain --> render[Render HTML]
+    topics -->|titles + key points| explain[Explain Topics<br/>all topics in one call]
+    explain -->|explanations + 3 Q&A each| render[Render HTML]
     render --> page([study_guide.html<br/>study view + flip cards])
 ```
 
-**LLM calls per video:** 1 (topics) + N (one per topic) ≈ 4–8 calls. With `gpt-4o-mini` that is well under a cent per video.
+**LLM calls per video:** 2 (topics, then explanations + Q&A). Default model `gpt-5.4-mini` (best quality of the models we compared: `gpt-4o-mini`, `gpt-4o`, `gpt-5.4-mini`).
 
 ## Utility Functions
 
@@ -90,7 +83,7 @@ flowchart LR
 1. **Call LLM** (`utils/call_llm.py`)
    - *Input*: prompt (str)
    - *Output*: response (str)
-   - Provider: OpenAI, default model `gpt-4o-mini` (override with `OPENAI_MODEL`); key read from `OPENAI_API_KEY` in `.env`
+   - Provider: OpenAI, default model `gpt-5.4-mini` (override with `OPENAI_MODEL`); key read from `OPENAI_API_KEY` in `.env`
    - Used later by nodes that extract topics, write simple explanations, and generate Q&A
    - Necessity: the only way nodes talk to the model
 
@@ -167,7 +160,7 @@ sequenceDiagram
     end
 ```
 
-- The model defaults to `gpt-4o-mini`. Change it with `OPENAI_MODEL` in `.env` without touching the code.
+- The model defaults to `gpt-5.4-mini`. Change it with `OPENAI_MODEL` in `.env` without touching the code.
 - Only this file knows which provider is used, so switching provider means changing one file.
 
 #### Shared rules for both utilities
@@ -188,10 +181,11 @@ Each topic is one dict that later nodes fill in, so nothing is stored twice.
 shared = {
     "url": "https://www.youtube.com/watch?v=...",  # input
     "transcript": "full caption text ...",         # Fetch Transcript
-    "topics": [                                    # Extract Topics creates title + summary
+    "topics": [                                    # Extract Topics creates title, summary, key points
         {
             "title": "What a neural network is",
             "summary": "One-line description of the topic",
+            "key_points": ["Specific point, only in this topic"],  # Extract Topics
             "explanation": "Plain-language explanation",   # Explain Topics adds
             "questions": [                                 # Explain Topics adds
                 {"question": "...", "answer": "..."},
@@ -219,15 +213,15 @@ shared = {
    - *Type*: Regular (retries on a malformed reply)
    - *Steps*:
      - *prep*: read `transcript`
-     - *exec*: call `call_llm` asking for 3–7 topics as YAML (title + summary), in the video's language; check it parses and the count is 3–7
-     - *post*: write `topics` (title + summary only)
+     - *exec*: call `call_llm` asking for 3–7 non-overlapping topics as YAML (title, summary, 2–4 key points that appear under one topic only), in the video's language; check it parses and every topic has a title and key points
+     - *post*: write `topics` (title, summary, key points)
 
 3. **Explain Topics**
    - *Purpose*: make each topic easy to understand and testable
-   - *Type*: Batch (one item per topic)
+   - *Type*: Regular (one call for all topics, so no question repeats across topics)
    - *Steps*:
-     - *prep*: return one item per topic: (transcript, topic title, topic summary, titles of the other topics so it does not repeat them)
-     - *exec*: call `call_llm` asking for a beginner-friendly explanation and 3 Q&A pairs as YAML, using only what the video says; check the fields exist
+     - *prep*: read `transcript` and `topics`
+     - *exec*: call `call_llm` once with every topic and its key points, asking for a beginner-friendly explanation and exactly 3 specific Q&A pairs per topic as YAML, using only what the video says; check there is one entry per topic, each with an explanation and exactly 3 questions
      - *post*: add `explanation` and `questions` to each dict in `topics`
 
 4. **Render HTML**

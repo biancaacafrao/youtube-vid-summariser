@@ -15,7 +15,7 @@ def call_llm(prompt: str) -> str:
         raise ValueError("OPENAI_API_KEY is not set (add it to .env)")
 
     client = OpenAI(api_key=api_key)
-    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    model = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
     logger.info("Calling LLM model=%s (prompt length=%s)", model, len(prompt))
     response = client.chat.completions.create(
         model=model,
